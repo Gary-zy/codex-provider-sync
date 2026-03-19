@@ -13,11 +13,13 @@ import {
 import { createBackup, restoreBackup } from "./backup.js";
 import { acquireLock } from "./locking.js";
 import {
+  assertSessionFilesWritable,
   applySessionChanges,
   collectSessionChanges,
   summarizeProviderCounts
 } from "./session-files.js";
 import {
+  assertSqliteWritable,
   readSqliteProviderCounts,
   updateSqliteProvider
 } from "./sqlite-state.js";
@@ -83,7 +85,8 @@ export function renderStatus(status) {
 export async function runSync({
   codexHome: explicitCodexHome,
   provider,
-  configBackupText
+  configBackupText,
+  sqliteBusyTimeoutMs
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
   await ensureCodexHome(codexHome);
@@ -96,6 +99,8 @@ export async function runSync({
   let backupDir = null;
   try {
     const { changes, providerCounts } = await collectSessionChanges(codexHome, targetProvider);
+    await assertSessionFilesWritable(changes);
+    await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
     backupDir = await createBackup({
       codexHome,
       targetProvider,
@@ -104,9 +109,20 @@ export async function runSync({
       configBackupText
     });
 
+    let sessionRestoreNeeded = false;
     try {
-      await applySessionChanges(changes);
-      const sqliteResult = await updateSqliteProvider(codexHome, targetProvider);
+      const sqliteResult = await updateSqliteProvider(
+        codexHome,
+        targetProvider,
+        async () => {
+          if (changes.length === 0) {
+            return;
+          }
+          sessionRestoreNeeded = true;
+          await applySessionChanges(changes);
+        },
+        { busyTimeoutMs: sqliteBusyTimeoutMs }
+      );
       return {
         codexHome,
         targetProvider,
@@ -118,8 +134,18 @@ export async function runSync({
         rolloutCountsBefore: summarizeProviderCounts(providerCounts)
       };
     } catch (error) {
-      if (backupDir) {
-        await restoreBackup(backupDir, codexHome);
+      if (backupDir && sessionRestoreNeeded) {
+        try {
+          await restoreBackup(backupDir, codexHome, {
+            restoreConfig: false,
+            restoreDatabase: false,
+            restoreSessions: true
+          });
+        } catch (restoreError) {
+          throw new Error(
+            `Failed to restore rollout files after sync error. Original error: ${error.message}. Restore error: ${restoreError.message}`
+          );
+        }
       }
       throw error;
     }

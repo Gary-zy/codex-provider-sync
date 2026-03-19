@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -55,6 +56,62 @@ async function writeStateDb(codexHome, rows) {
   } finally {
     db.close();
   }
+}
+
+async function lockRolloutFile(filePath) {
+  const script = `
+& {
+  param([string]$path)
+  $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+  try {
+    Write-Output 'locked'
+    [Console]::Out.Flush()
+    Start-Sleep -Seconds 30
+  } finally {
+    $stream.Close()
+  }
+}
+`.trim();
+
+  const child = spawn("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script,
+    filePath
+  ], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let stdout = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+      if (!settled && stdout.includes("locked")) {
+        settled = true;
+        resolve();
+      }
+    });
+
+    child.once("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
+
+    child.once("exit", (code, signal) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`Failed to acquire rollout file lock. Exit code: ${code ?? "null"}, signal: ${signal ?? "null"}`));
+      }
+    });
+  });
+
+  return child;
 }
 
 test("runSync rewrites rollout files and sqlite, then restore reverts both", async () => {
@@ -145,4 +202,81 @@ test("runSwitch rejects unknown custom providers", async () => {
     () => runSwitch({ codexHome, provider: "missing" }),
     /Provider "missing" is not available/
   );
+});
+
+test("runSync leaves rollout files and sqlite untouched when sqlite is locked", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-a.jsonl");
+  await writeRollout(sessionPath, "thread-a", "apigather");
+  await writeStateDb(codexHome, [
+    { id: "thread-a", model_provider: "apigather", archived: false }
+  ]);
+
+  const lockDb = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    lockDb.exec("BEGIN IMMEDIATE");
+    await assert.rejects(
+      () => runSync({ codexHome, sqliteBusyTimeoutMs: 0 }),
+      /state_5\.sqlite is currently in use/
+    );
+  } finally {
+    try {
+      lockDb.exec("ROLLBACK");
+    } catch {
+      // Ignore cleanup failures in tests.
+    }
+    lockDb.close();
+  }
+
+  const rollout = await fs.readFile(sessionPath, "utf8");
+  assert.match(rollout, /"model_provider":"apigather"/);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    const row = db
+      .prepare("SELECT model_provider FROM threads WHERE id = ?")
+      .get("thread-a");
+    assert.equal(row.model_provider, "apigather");
+  } finally {
+    db.close();
+  }
+});
+
+test("runSync leaves rollout files and sqlite untouched when a rollout file is locked", async () => {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-a.jsonl");
+  await writeRollout(sessionPath, "thread-a", "apigather");
+  await writeStateDb(codexHome, [
+    { id: "thread-a", model_provider: "apigather", archived: false }
+  ]);
+
+  const lockProcess = await lockRolloutFile(sessionPath);
+  try {
+    await assert.rejects(
+      () => runSync({ codexHome, sqliteBusyTimeoutMs: 0 }),
+      /Unable to (read|rewrite) rollout file because it is currently in use/
+    );
+  } finally {
+    lockProcess.kill();
+    await new Promise((resolve) => lockProcess.once("exit", resolve));
+  }
+
+  const rollout = await fs.readFile(sessionPath, "utf8");
+  assert.match(rollout, /"model_provider":"apigather"/);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    const row = db
+      .prepare("SELECT model_provider FROM threads WHERE id = ?")
+      .get("thread-a");
+    assert.equal(row.model_provider, "apigather");
+  } finally {
+    db.close();
+  }
 });

@@ -1,8 +1,30 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { SESSION_DIRS } from "./constants.js";
+
+const execFileAsync = promisify(execFile);
+
+function isRolloutFileBusyError(error) {
+  const message = `${error?.code ?? ""} ${error?.message ?? ""}`.toLowerCase();
+  return message.includes("ebusy")
+    || message.includes("resource busy or locked")
+    || message.includes("being used by another process")
+    || message.includes("eperm");
+}
+
+function wrapRolloutFileBusyError(error, filePath, action) {
+  if (!isRolloutFileBusyError(error)) {
+    return error;
+  }
+  return new Error(
+    `Unable to ${action} rollout file because it is currently in use. Close Codex and the Codex app, then retry. Locked file: ${filePath}`
+  );
+}
 
 async function listJsonlFiles(rootDir) {
   const entries = await fsp.readdir(rootDir, { withFileTypes: true });
@@ -21,8 +43,9 @@ async function listJsonlFiles(rootDir) {
 }
 
 async function readFirstLineRecord(filePath) {
-  const handle = await fsp.open(filePath, "r");
+  let handle;
   try {
+    handle = await fsp.open(filePath, "r");
     let position = 0;
     let collected = Buffer.alloc(0);
     while (true) {
@@ -49,8 +72,10 @@ async function readFirstLineRecord(filePath) {
       separator: "",
       offset: collected.length
     };
+  } catch (error) {
+    throw wrapRolloutFileBusyError(error, filePath, "read");
   } finally {
-    await handle.close();
+    await handle?.close();
   }
 }
 
@@ -74,31 +99,75 @@ async function rewriteFirstLine(filePath, nextFirstLine, separator) {
   const tmpPath = `${filePath}.provider-sync.${process.pid}.${Date.now()}.tmp`;
   const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
 
-  await new Promise((resolve, reject) => {
-    writer.on("error", reject);
-    writer.write(nextFirstLine);
-    if (separator) {
-      writer.write(separator);
-    }
+  try {
+    await new Promise((resolve, reject) => {
+      writer.on("error", reject);
+      writer.write(nextFirstLine);
+      if (separator) {
+        writer.write(separator);
+      }
 
-    const headerOnly =
-      current.separator === "" &&
-      current.offset === Buffer.byteLength(current.firstLine, "utf8");
+      const headerOnly =
+        current.separator === "" &&
+        current.offset === Buffer.byteLength(current.firstLine, "utf8");
 
-    if (headerOnly) {
-      writer.end();
+      if (headerOnly) {
+        writer.end();
+        writer.once("finish", resolve);
+        return;
+      }
+
+      const reader = fs.createReadStream(filePath, { start: current.offset });
+      reader.on("error", reject);
+      reader.on("end", () => writer.end());
       writer.once("finish", resolve);
-      return;
+      reader.pipe(writer, { end: false });
+    });
+
+    await fsp.rename(tmpPath, filePath);
+  } catch (error) {
+    await fsp.rm(tmpPath, { force: true });
+    throw wrapRolloutFileBusyError(error, filePath, "rewrite");
+  }
+}
+
+async function findLockedFilesOnWindows(filePaths) {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-provider-locks-"));
+  const manifestPath = path.join(tempDir, "paths.json");
+  const script = `
+& {
+  param([string]$manifestPath)
+  $paths = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
+  foreach ($path in $paths) {
+    try {
+      $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+      $stream.Close()
+    } catch {
+      Write-Output $path
     }
+  }
+}
+`.trim();
 
-    const reader = fs.createReadStream(filePath, { start: current.offset });
-    reader.on("error", reject);
-    reader.on("end", () => writer.end());
-    writer.once("finish", resolve);
-    reader.pipe(writer, { end: false });
-  });
-
-  await fsp.rename(tmpPath, filePath);
+  try {
+    await fsp.writeFile(manifestPath, JSON.stringify(filePaths), "utf8");
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+      manifestPath
+    ]);
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    throw new Error(`Unable to verify rollout file locks on Windows. ${error.message}`);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 export async function collectSessionChanges(codexHome, targetProvider) {
@@ -145,6 +214,24 @@ export async function applySessionChanges(changes) {
   for (const change of changes) {
     await rewriteFirstLine(change.path, change.updatedFirstLine, change.originalSeparator);
   }
+}
+
+export async function assertSessionFilesWritable(changes) {
+  if (!changes?.length || process.platform !== "win32") {
+    return;
+  }
+
+  const lockedPaths = await findLockedFilesOnWindows(changes.map((change) => change.path));
+  if (lockedPaths.length === 0) {
+    return;
+  }
+
+  const preview = lockedPaths.slice(0, 5).join(", ");
+  const extraCount = lockedPaths.length - Math.min(lockedPaths.length, 5);
+  const suffix = extraCount > 0 ? ` (+${extraCount} more)` : "";
+  throw new Error(
+    `Unable to rewrite rollout files because ${lockedPaths.length} file(s) are currently in use. Close Codex and the Codex app, then retry. Locked file(s): ${preview}${suffix}`
+  );
 }
 
 export async function restoreSessionChanges(manifestEntries) {

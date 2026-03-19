@@ -313,6 +313,12 @@ codex-provider sync
 
 认证仍然需要你自己处理。
 
+### `state_5.sqlite is currently in use` 是什么意思？
+
+这表示官方 Codex、Codex App，或者其他进程还占着 SQLite 状态库。
+
+先把 Codex、Codex App、app-server 之类相关进程关掉，再重新执行 `sync` 或 `restore`。
+
 ### 为什么我的自定义 provider 不被接受？
 
 `switch <provider-id>` 会校验 provider 是否已经存在于 `config.toml`，内置 `openai` 除外。

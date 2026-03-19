@@ -303,6 +303,12 @@ No.
 
 You still handle auth separately if your provider requires it.
 
+### What does `state_5.sqlite is currently in use` mean?
+
+It means official Codex, Codex App, or another process still has the SQLite state database open.
+
+Close Codex, close the Codex App or app-server process, then run `sync` or `restore` again.
+
 ### What if my custom provider is not accepted?
 
 `switch <provider-id>` validates that the provider exists in `config.toml`, except for built-in `openai`.

@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { BACKUP_NAMESPACE, DB_FILE_BASENAME, defaultBackupRoot } from "./constants.js";
-import { restoreSessionChanges } from "./session-files.js";
+import { assertSessionFilesWritable, restoreSessionChanges } from "./session-files.js";
+import { assertSqliteWritable } from "./sqlite-state.js";
 
 function timestampSlug(date = new Date()) {
   return date.toISOString().replaceAll(":", "").replaceAll("-", "").replace(".", "");
@@ -88,31 +89,49 @@ export async function createBackup({
   return backupDir;
 }
 
-export async function restoreBackup(backupDir, codexHome) {
+export async function restoreBackup(backupDir, codexHome, options = {}) {
+  const {
+    restoreConfig = true,
+    restoreDatabase = true,
+    restoreSessions = true
+  } = options;
   const metadataPath = path.join(backupDir, "metadata.json");
   const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
   if (metadata.codexHome !== codexHome) {
     throw new Error(`Backup was created for ${metadata.codexHome}, not ${codexHome}.`);
   }
 
-  const configBackupPath = path.join(backupDir, "config.toml");
-  await copyIfPresent(configBackupPath, path.join(codexHome, "config.toml"));
+  let sessionManifest = null;
+  if (restoreSessions) {
+    const sessionManifestPath = path.join(backupDir, "session-meta-backup.json");
+    sessionManifest = JSON.parse(await fs.readFile(sessionManifestPath, "utf8"));
+    await assertSessionFilesWritable(sessionManifest.files ?? []);
+  }
 
-  const dbDir = path.join(backupDir, "db");
-  const backedUpFiles = new Set(metadata.dbFiles ?? []);
-  for (const suffix of ["", "-shm", "-wal"]) {
-    const fileName = `${DB_FILE_BASENAME}${suffix}`;
-    if (!backedUpFiles.has(fileName)) {
-      await removeIfPresent(path.join(codexHome, fileName));
+  const configBackupPath = path.join(backupDir, "config.toml");
+  if (restoreConfig) {
+    await copyIfPresent(configBackupPath, path.join(codexHome, "config.toml"));
+  }
+
+  if (restoreDatabase) {
+    await assertSqliteWritable(codexHome);
+
+    const dbDir = path.join(backupDir, "db");
+    const backedUpFiles = new Set(metadata.dbFiles ?? []);
+    for (const suffix of ["", "-shm", "-wal"]) {
+      const fileName = `${DB_FILE_BASENAME}${suffix}`;
+      if (!backedUpFiles.has(fileName)) {
+        await removeIfPresent(path.join(codexHome, fileName));
+      }
+    }
+    for (const fileName of metadata.dbFiles ?? []) {
+      await copyIfPresent(path.join(dbDir, fileName), path.join(codexHome, fileName));
     }
   }
-  for (const fileName of metadata.dbFiles ?? []) {
-    await copyIfPresent(path.join(dbDir, fileName), path.join(codexHome, fileName));
-  }
 
-  const sessionManifestPath = path.join(backupDir, "session-meta-backup.json");
-  const sessionManifest = JSON.parse(await fs.readFile(sessionManifestPath, "utf8"));
-  await restoreSessionChanges(sessionManifest.files ?? []);
+  if (restoreSessions) {
+    await restoreSessionChanges(sessionManifest.files ?? []);
+  }
 
   return metadata;
 }
