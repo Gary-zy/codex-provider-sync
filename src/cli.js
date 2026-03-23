@@ -2,6 +2,7 @@
 
 import path from "node:path";
 
+import { installWindowsLauncher } from "./launcher.js";
 import {
   getStatus,
   renderStatus,
@@ -18,6 +19,7 @@ Usage:
   codex-provider sync [--provider ID] [--codex-home PATH]
   codex-provider switch <provider-id> [--codex-home PATH]
   codex-provider restore <backup-dir> [--codex-home PATH]
+  codex-provider install-windows-launcher [--dir PATH] [--codex-home PATH]
 `);
 }
 
@@ -109,6 +111,23 @@ async function main() {
     console.log(`Restored backup from ${path.resolve(backupDir)}`);
     console.log(`Codex home: ${result.codexHome}`);
     console.log(`Provider at backup time: ${result.targetProvider}`);
+    return;
+  }
+
+  if (command === "install-windows-launcher") {
+    const result = await installWindowsLauncher({
+      dir: flags.dir,
+      codexHome: flags["codex-home"]
+    });
+    console.log("Installed Windows launcher files:");
+    console.log(`  Hidden double-click launcher: ${result.vbsPath}`);
+    console.log(`  Visible console launcher: ${result.cmdPath}`);
+    console.log(`  Target directory: ${result.targetDir}`);
+    if (result.codexHome) {
+      console.log(`  Fixed CODEX_HOME: ${result.codexHome}`);
+    } else {
+      console.log("  CODEX_HOME: default current environment / ~/.codex");
+    }
     return;
   }
 

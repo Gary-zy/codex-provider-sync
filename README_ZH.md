@@ -62,6 +62,12 @@ codex-provider switch apigather
 codex-provider status
 ```
 
+生成一个可双击的 Windows 启动器（默认放到桌面）：
+
+```bash
+codex-provider install-windows-launcher
+```
+
 从备份回滚：
 
 ```bash
@@ -89,6 +95,7 @@ codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\<timestam
 - 只想查看状态：`codex-provider status`
 - 当前 provider 不变，只修复历史会话可见性：`codex-provider sync`
 - 切 provider 并同步历史：`codex-provider switch openai`
+- 安装桌面双击启动器：`codex-provider install-windows-launcher`
 - 回滚误操作：`codex-provider restore <backup-dir>`
 
 ## 命令说明
@@ -104,6 +111,12 @@ codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\<timestam
   - 然后立即执行一次同步
 - `codex-provider restore <backup-dir>`
   - 从历史备份恢复
+- `codex-provider install-windows-launcher`
+  - 默认在桌面生成两个文件
+  - `Codex Provider Sync.vbs`：双击后隐藏执行，结束后弹窗显示结果
+  - `Codex Provider Sync.cmd`：可见控制台版本，方便排错
+  - `--dir <path>` 可改安装目录
+  - `--codex-home <path>` 可把固定的 `CODEX_HOME` 写进启动器
 
 常见用法：
 
@@ -112,6 +125,9 @@ codex-provider status
 codex-provider sync
 codex-provider sync --provider openai
 codex-provider switch apigather
+codex-provider install-windows-launcher
+codex-provider install-windows-launcher --dir D:\Tools
+codex-provider install-windows-launcher --codex-home C:\Users\you\.codex
 codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\20260319T042708906Z
 ```
 
@@ -134,6 +150,7 @@ codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\20260319T
 - 它不会替换官方 `codex`
 - 它不会帮你处理 `auth.json` 或第三方切号工具
 - 它不会改消息历史、标题、cwd、时间戳
+- `Codex Provider Sync.vbs` 依赖 `codex-provider` 命令本身已经可用
 - 如果 `state_5.sqlite` 被占用，先关闭 Codex / Codex App / app-server 再重试
 - 如果当前活跃会话锁住了某个 rollout 文件，`sync` 会跳过该文件并继续处理其它历史会话
 

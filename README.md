@@ -62,6 +62,12 @@ Check current state first:
 codex-provider status
 ```
 
+Install a Windows double-click launcher (placed on your Desktop by default):
+
+```bash
+codex-provider install-windows-launcher
+```
+
 Rollback from a backup:
 
 ```bash
@@ -89,6 +95,7 @@ Quick mapping:
 - inspect only: `codex-provider status`
 - fix visibility under current provider: `codex-provider sync`
 - switch provider and sync: `codex-provider switch openai`
+- install a desktop double-click launcher: `codex-provider install-windows-launcher`
 - roll back a mistake: `codex-provider restore <backup-dir>`
 
 ## Commands
@@ -104,6 +111,12 @@ Quick mapping:
   - immediately runs a sync
 - `codex-provider restore <backup-dir>`
   - restores a previous backup
+- `codex-provider install-windows-launcher`
+  - creates two files on the Desktop by default
+  - `Codex Provider Sync.vbs`: hidden double-click launcher with a result popup
+  - `Codex Provider Sync.cmd`: visible console version for troubleshooting
+  - use `--dir <path>` to choose another install directory
+  - use `--codex-home <path>` to bake a fixed `CODEX_HOME` into the launcher
 
 ```bash
 codex-provider status
@@ -111,6 +124,9 @@ codex-provider sync
 codex-provider sync --provider openai
 codex-provider switch openai
 codex-provider switch apigather
+codex-provider install-windows-launcher
+codex-provider install-windows-launcher --dir D:\Tools
+codex-provider install-windows-launcher --codex-home C:\Users\you\.codex
 codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\20260319T042708906Z
 codex-provider status --codex-home C:\Users\you\.codex
 codex-provider sync --codex-home C:\Users\you\.codex
@@ -135,6 +151,7 @@ It also uses:
 - It does not replace official `codex`.
 - It does not manage `auth.json` or third-party login tools.
 - It does not rewrite message history, titles, cwd, or timestamps.
+- `Codex Provider Sync.vbs` assumes the `codex-provider` command is already available.
 - If `state_5.sqlite` is in use, close Codex / Codex App / app-server and retry.
 - If a live session keeps one rollout file open, `sync` skips that file and reports it. Rerun later.
 
