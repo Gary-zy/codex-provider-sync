@@ -94,15 +94,69 @@ function listSessionsFromDb(codexHome) {
   } finally { db.close(); }
 }
 
+function quoteSqliteIdentifier(value) {
+  return `"${String(value).replaceAll("\"", "\"\"")}"`;
+}
+
+function listThreadReferenceCleanupPlans(db) {
+  const tables = db.prepare(`
+    SELECT name
+    FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+  `).all();
+
+  const plans = [];
+  for (const table of tables) {
+    if (table.name === "threads") continue;
+    const columnRows = db.prepare(`PRAGMA table_info(${quoteSqliteIdentifier(table.name)})`).all();
+    const columns = new Set(columnRows.map((row) => row.name));
+    const clauses = [];
+    if (columns.has("thread_id")) clauses.push("thread_id = ?");
+    if (columns.has("parent_thread_id")) clauses.push("parent_thread_id = ?");
+    if (columns.has("child_thread_id")) clauses.push("child_thread_id = ?");
+    if (!clauses.length) continue;
+    plans.push({
+      tableName: table.name,
+      whereClause: clauses.join(" OR "),
+      parameterCount: clauses.length
+    });
+  }
+  return plans;
+}
+
+function deleteThreadReferences(db, sessionId) {
+  for (const plan of listThreadReferenceCleanupPlans(db)) {
+    db.prepare(
+      `DELETE FROM ${quoteSqliteIdentifier(plan.tableName)} WHERE ${plan.whereClause}`
+    ).run(...Array(plan.parameterCount).fill(sessionId));
+  }
+}
+
 async function deleteSessionById(codexHome, sessionId) {
   const dbPath = path.join(codexHome, DB_FILE_BASENAME);
   let rolloutPath = null;
   const db = new DatabaseSync(dbPath);
+  let transactionOpen = false;
   try {
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
     const row = db.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(sessionId);
     if (!row) throw new Error(`会话 ${sessionId} 不存在`);
     rolloutPath = row.rollout_path;
+    deleteThreadReferences(db, sessionId);
     db.prepare("DELETE FROM threads WHERE id = ?").run(sessionId);
+    db.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures and surface the original error.
+      }
+    }
+    throw error;
   } finally { db.close(); }
 
   if (rolloutPath) {

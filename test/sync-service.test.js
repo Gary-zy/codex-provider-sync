@@ -16,6 +16,7 @@ import {
 import { getStatus, runRestore, runSwitch, runSync } from "../src/service.js";
 import { DEFAULT_BACKUP_RETENTION_COUNT } from "../src/constants.js";
 import { applySessionChanges, collectSessionChanges } from "../src/session-files.js";
+import { startWebServer } from "../src/web-server.js";
 
 async function makeTempCodexHome() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-provider-sync-"));
@@ -187,6 +188,124 @@ async function runCli(args) {
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+async function withWebServer(codexHome, callback) {
+  const { server, url } = await startWebServer({ codexHome, port: 0 });
+  try {
+    return await callback(url);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function deleteSessionsViaApi(codexHome, ids) {
+  return await withWebServer(codexHome, async (url) => {
+    const response = await fetch(`${url}/api/sessions/delete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ ids })
+    });
+    const payload = await response.json();
+    return { response, payload };
+  });
+}
+
+async function writeDeleteStateDb(codexHome, threads, edges) {
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL
+      );
+
+      CREATE TABLE thread_spawn_edges (
+        parent_thread_id TEXT NOT NULL,
+        child_thread_id TEXT NOT NULL PRIMARY KEY,
+        status TEXT NOT NULL
+      );
+
+      CREATE TABLE stage1_outputs (
+        thread_id TEXT PRIMARY KEY,
+        raw_memory TEXT NOT NULL DEFAULT '',
+        rollout_summary TEXT NOT NULL DEFAULT '',
+        source_updated_at INTEGER NOT NULL DEFAULT 0,
+        generated_at INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE thread_dynamic_tools (
+        thread_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        input_schema TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (thread_id, position)
+      );
+    `);
+
+    const insertThread = db.prepare("INSERT INTO threads (id, rollout_path) VALUES (?, ?)");
+    const insertEdge = db.prepare(
+      "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)"
+    );
+    const insertStage = db.prepare("INSERT INTO stage1_outputs (thread_id) VALUES (?)");
+    const insertTool = db.prepare(
+      "INSERT INTO thread_dynamic_tools (thread_id, position, name, description, input_schema) VALUES (?, ?, ?, ?, ?)"
+    );
+
+    for (const thread of threads) {
+      insertThread.run(thread.id, thread.rolloutPath);
+      insertStage.run(thread.id);
+      insertTool.run(thread.id, 0, `${thread.id}-tool`, "desc", "{}");
+    }
+
+    for (const edge of edges) {
+      insertEdge.run(edge.parentId, edge.childId, edge.status ?? "completed");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function getThreadRowCount(db, id) {
+  return db.prepare("SELECT COUNT(*) AS count FROM threads WHERE id = ?").get(id).count;
+}
+
+function getStageRowCount(db, id) {
+  return db.prepare("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?").get(id).count;
+}
+
+function getToolRowCount(db, id) {
+  return db.prepare("SELECT COUNT(*) AS count FROM thread_dynamic_tools WHERE thread_id = ?").get(id).count;
+}
+
+function getEdgeRowCount(db, id) {
+  return db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM thread_spawn_edges
+    WHERE parent_thread_id = ? OR child_thread_id = ?
+  `).get(id, id).count;
+}
+
+async function createDeleteFixture(codexHome) {
+  const parentRolloutPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-parent.jsonl");
+  const childRolloutPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-child.jsonl");
+  await writeRollout(parentRolloutPath, "thread-parent", "openai");
+  await writeRollout(childRolloutPath, "thread-child", "openai");
+  await writeDeleteStateDb(
+    codexHome,
+    [
+      { id: "thread-parent", rolloutPath: parentRolloutPath },
+      { id: "thread-child", rolloutPath: childRolloutPath }
+    ],
+    [
+      { parentId: "thread-parent", childId: "thread-child" }
+    ]
+  );
+  return { parentRolloutPath, childRolloutPath };
 }
 
 test("runSync rewrites rollout files and sqlite, then restore reverts both", async () => {
@@ -627,4 +746,59 @@ test("cli sync prints stage progress and backup timing", async () => {
   assert.match(result.stdout, /\[6\/6\] Cleaning backups\.\.\./);
   assert.match(result.stdout, /Backup created in .*: .+/);
   assert.match(result.stdout, /Backup creation time: /);
+});
+
+test("delete sessions API removes child session rows, rollout files, and thread associations", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  const { parentRolloutPath, childRolloutPath } = await createDeleteFixture(codexHome);
+
+  const { response, payload } = await deleteSessionsViaApi(codexHome, ["thread-child"]);
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.deleted, 1);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    assert.equal(getThreadRowCount(db, "thread-child"), 0);
+    assert.equal(getStageRowCount(db, "thread-child"), 0);
+    assert.equal(getToolRowCount(db, "thread-child"), 0);
+    assert.equal(getEdgeRowCount(db, "thread-child"), 0);
+
+    assert.equal(getThreadRowCount(db, "thread-parent"), 1);
+    assert.equal(getStageRowCount(db, "thread-parent"), 1);
+    assert.equal(getToolRowCount(db, "thread-parent"), 1);
+  } finally {
+    db.close();
+  }
+
+  await fs.access(parentRolloutPath);
+  await assert.rejects(fs.access(childRolloutPath));
+});
+
+test("delete sessions API removes parent associations without deleting child sessions", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  const { parentRolloutPath, childRolloutPath } = await createDeleteFixture(codexHome);
+
+  const { response, payload } = await deleteSessionsViaApi(codexHome, ["thread-parent"]);
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.deleted, 1);
+
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  try {
+    assert.equal(getThreadRowCount(db, "thread-parent"), 0);
+    assert.equal(getStageRowCount(db, "thread-parent"), 0);
+    assert.equal(getToolRowCount(db, "thread-parent"), 0);
+    assert.equal(getEdgeRowCount(db, "thread-parent"), 0);
+
+    assert.equal(getThreadRowCount(db, "thread-child"), 1);
+    assert.equal(getStageRowCount(db, "thread-child"), 1);
+    assert.equal(getToolRowCount(db, "thread-child"), 1);
+    assert.equal(getEdgeRowCount(db, "thread-child"), 0);
+  } finally {
+    db.close();
+  }
+
+  await fs.access(childRolloutPath);
+  await assert.rejects(fs.access(parentRolloutPath));
 });
